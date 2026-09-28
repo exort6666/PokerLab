@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Данные (не коммитим)
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/sample_hh/*
+!data/sample_hh/.gitkeep
+data/preflop_equity.json.old
+data/preflop_equity.json.bak
+data/preflop_equity.json.bak2
+
+# Окружение
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
