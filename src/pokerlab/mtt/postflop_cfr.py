@@ -1,11 +1,10 @@
 """
-Vector CFR+ / DCFR для постфлоп-дерева (один конкретный борд).
+Vector CFR+ для постфлоп-дерева (один борд).
 
-Финальная версия (v5.1 — самая быстрая из проверенных).
-
-Скорость: ~4.7 iter/s на борде AsKsQs, 25 BB, 5517 узлов.
-Дальнейшее ускорение требует батчирования по узлам одного уровня
-(см. docs/backlog.md). Принимаем как есть для MVP.
+v5.2:
+    * В PostflopStrategy добавлено u_root (169×169) — utility IP
+      для пары рук (i, j) на корне дерева при игре по Nash-σ.
+    * Реализация: финальный bottom-up проход после усреднения σ.
 
 Reference:
     Zinkevich et al. (2007). Regret Minimization in Games with
@@ -17,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -59,6 +58,7 @@ class PostflopStrategy:
     iterations: int
     elapsed_sec: float
     rank_table: np.ndarray
+    u_root: np.ndarray | None = None   # (169, 169) float32
 
 
 class PostflopSolverVector:
@@ -94,7 +94,6 @@ class PostflopSolverVector:
                 node.children[a.value] for a in node.actions
             ]
             node._n_act = n
-
             self.regret[key] = np.zeros((N_HANDS, n), dtype=np.float32)
             self.strat_sum[key] = np.zeros((N_HANDS, n), dtype=np.float32)
             self.actions_of[key] = list(node.actions)
@@ -106,7 +105,6 @@ class PostflopSolverVector:
         max_act = max((n._n_act for n in self.node_refs.values()),
                       default=1)
         self._buf_scaled = np.empty((N_HANDS, max_act), dtype=np.float32)
-
         self.rng = np.random.default_rng(seed)
 
     def _current_strategy(self, key: str) -> np.ndarray:
@@ -122,10 +120,8 @@ class PostflopSolverVector:
         cached = getattr(node, "_cached_u", None)
         if cached is not None:
             return cached
-
         pot = float(node.pot_bb)
         inv_ip = float(node.invested_ip)
-
         if node.terminal_kind == "fold":
             u = np.empty((N_HANDS, N_HANDS), dtype=np.float32)
             if node.winner_if_fold == "IP":
@@ -136,30 +132,20 @@ class PostflopSolverVector:
             u = self.win_matrix * pot - inv_ip
         else:
             raise ValueError(f"Неизвестный терминал: {node.terminal_kind}")
-
         node._cached_u = u
         return u
 
-    def _cfr_pass(
-        self,
-        node: PostflopNode,
-        reach_ip: np.ndarray,
-        reach_oop: np.ndarray,
-        t: int,
-    ) -> np.ndarray:
+    def _cfr_pass(self, node, reach_ip, reach_oop, t):
         if node.is_terminal:
             return self._terminal_u(node)
-
         key = node._key
         n_act = node._n_act
         if n_act == 0:
             return (self.win_matrix * float(node.pot_bb)
                     - float(node.invested_ip))
-
         σ = self._current_strategy(key)
         actor = node.actor
         children = node._children_list
-
         buf = self._buf_scaled[:, :n_act]
         np.multiply(σ, t, out=buf)
         self.strat_sum[key] += buf
@@ -167,15 +153,13 @@ class PostflopSolverVector:
         u_actions = []
         if actor == "IP":
             for a_idx in range(n_act):
-                new_reach_ip = reach_ip * σ[:, a_idx]
                 u_actions.append(self._cfr_pass(
-                    children[a_idx], new_reach_ip, reach_oop, t,
+                    children[a_idx], reach_ip * σ[:, a_idx], reach_oop, t,
                 ))
         else:
             for a_idx in range(n_act):
-                new_reach_oop = reach_oop * σ[:, a_idx]
                 u_actions.append(self._cfr_pass(
-                    children[a_idx], reach_ip, new_reach_oop, t,
+                    children[a_idx], reach_ip, reach_oop * σ[:, a_idx], t,
                 ))
 
         if actor == "IP":
@@ -191,32 +175,69 @@ class PostflopSolverVector:
         if actor == "IP":
             weighted = PI_OPP_F32 * reach_oop[None, :]
             for a_idx in range(n_act):
-                v_a = np.einsum('ij,ij->i', weighted, u_actions[a_idx])
-                reg[:, a_idx] += v_a
+                reg[:, a_idx] += np.einsum(
+                    'ij,ij->i', weighted, u_actions[a_idx],
+                )
             v_node = np.einsum('ij,ij->i', weighted, u_node)
             reg -= v_node[:, None]
         else:
             weighted = PI_OPP_T_F32 * reach_ip[:, None]
             for a_idx in range(n_act):
-                v_a = -np.einsum('ij,ij->j', weighted, u_actions[a_idx])
-                reg[:, a_idx] += v_a
+                reg[:, a_idx] -= np.einsum(
+                    'ij,ij->j', weighted, u_actions[a_idx],
+                )
             v_node = -np.einsum('ij,ij->j', weighted, u_node)
             reg -= v_node[:, None]
-
         return u_node
+
+    def _compute_u_root_final(self, avg_strategies: dict) -> np.ndarray:
+        """
+        Один bottom-up проход с финальными σ, вычисляет U_root[i,j].
+        Utility IP для пары рук (i, j) при игре по финальной стратегии.
+        """
+        U_dict: dict[str, np.ndarray] = {}
+
+        for node in reversed(list(iter_nodes(self.root))):
+            if node.is_terminal:
+                U_dict[node._key] = self._terminal_u(node)
+                continue
+            key = node._key
+            n_act = node._n_act
+            if n_act == 0:
+                U_dict[key] = (self.win_matrix * float(node.pot_bb)
+                               - float(node.invested_ip))
+                continue
+            σ = avg_strategies[key]
+            actor = node.actor
+            children = node._children_list
+
+            U0 = U_dict[children[0]._key]
+            if actor == "IP":
+                u_node = σ[:, 0][:, None] * U0
+                for a_idx in range(1, n_act):
+                    u_node += σ[:, a_idx][:, None] * U_dict[
+                        children[a_idx]._key
+                    ]
+            else:
+                u_node = σ[:, 0][None, :] * U0
+                for a_idx in range(1, n_act):
+                    u_node += σ[:, a_idx][None, :] * U_dict[
+                        children[a_idx]._key
+                    ]
+            U_dict[key] = u_node
+
+        return U_dict[self.root._key]
 
     def solve(self, iterations: int = 2000,
               log_every: int = 100) -> PostflopStrategy:
-        log.info("Постфлоп CFR+ (v5.1): %d итераций, борд=%s",
+        log.info("Постфлоп CFR+ (v5.2): %d итераций, борд=%s",
                  iterations, "".join(self.board))
         log.info("Узлов: %d", len(self.regret))
         t0 = time.time()
 
         one = np.ones(N_HANDS, dtype=np.float32)
-
         for t in range(1, iterations + 1):
             self._cfr_pass(self.root, one, one, t)
-
             if log_every and t % log_every == 0:
                 elapsed = time.time() - t0
                 rate = t / elapsed if elapsed > 0 else 0
@@ -234,11 +255,17 @@ class PostflopSolverVector:
                 s > 0, ss / np.where(s > 0, s, 1.0), 1.0 / n
             ).astype(np.float64)
 
+        # --- Финальный U_root ---
+        u_root = self._compute_u_root_final(avg_strategies)
+        log.info("U_root вычислен, shape=%s", u_root.shape)
+
         node_meta = {}
         for node in iter_nodes(self.root):
             node_meta[node._key] = {
                 "actor": node.actor,
                 "pot_bb": node.pot_bb,
+                "invested_ip": node.invested_ip,
+                "invested_oop": node.invested_oop,
                 "board": list(node.board),
                 "street": node.street.value,
                 "history": list(node.history),
@@ -259,31 +286,8 @@ class PostflopSolverVector:
             iterations=iterations,
             elapsed_sec=elapsed,
             rank_table=self.rank_table,
+            u_root=u_root,
         )
-
-
-def _find_root_key(res: PostflopStrategy) -> str | None:
-    for k in res.strategies:
-        if not res.node_meta[k].get("history"):
-            return k
-    return None
-
-
-def print_root_strategy(res: PostflopStrategy, top_n: int = 15) -> None:
-    root_key = _find_root_key(res)
-    if root_key is None:
-        print("Не нашли ROOT")
-        return
-    σ = res.strategies[root_key]
-    actions = res.actions_of[root_key]
-    actor = res.node_meta[root_key]["actor"]
-    print(f"--- ROOT (actor={actor}, "
-          f"actions={[a.value for a in actions]}) ---")
-    print(f"{'Hand':>6} | " + " ".join(f"{a.value:>6}"
-                                        for a in actions))
-    for i in range(min(top_n, N_HANDS)):
-        row = " ".join(f"{σ[i, a]:6.3f}" for a in range(len(actions)))
-        print(f"{ALL_HANDS[i]:>6} | {row}")
 
 
 if __name__ == "__main__":
@@ -292,20 +296,12 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
-
-    # Тест сходимости: 5000 итераций
     cfg = PostflopTreeConfig(
-        start_pot_bb=6.0,
-        start_stack_bb=25.0,
+        start_pot_bb=6.0, start_stack_bb=25.0,
         start_board=["As", "Ks", "Qs"],
-        start_street=Street.FLOP,
-        start_actor="OOP",
+        start_street=Street.FLOP, start_actor="OOP",
     )
-    print(f"Узлов в дереве: {count_nodes(build_postflop_tree(cfg))}")
-
     solver = PostflopSolverVector(cfg)
-    print(f"Узлов с regret: {len(solver.regret)}")
-
-    res = solver.solve(iterations=5000, log_every=500)
-    print()
-    print_root_strategy(res, top_n=15)
+    res = solver.solve(iterations=2000, log_every=200)
+    print(f"\nU_root[AA, KK] = {res.u_root[0, 1]:.3f}")
+    print(f"U_root shape   = {res.u_root.shape}")

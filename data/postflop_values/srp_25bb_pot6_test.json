@@ -1,0 +1,10 @@
+{
+  "boards": [
+    "AsKsQs",
+    "Kd7c2h",
+    "8h7h6c"
+  ],
+  "pot_bb": 6.0,
+  "stack_bb": 25.0,
+  "iterations": 500
+}

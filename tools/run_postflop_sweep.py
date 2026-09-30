@@ -1,10 +1,12 @@
 """
-Пакетный расчёт постфлоп-стратегий по сетке бордов (HU SRP).
+Пакетный расчёт постфлоп-стратегий для grid (board × config).
+
+Config = (pot, stack, name) — конкретные пары, которые реально
+встречаются в префлоп-дереве. НЕ cross-product pots × stacks.
 
 Запуск:
     python tools/run_postflop_sweep.py --quick
-    python tools/run_postflop_sweep.py --boards flop_dry flop_monotone ...
-    python tools/run_postflop_sweep.py --stacks 20 50 100
+    python tools/run_postflop_sweep.py --iterations 5000 --workers 3
 """
 
 from __future__ import annotations
@@ -24,52 +26,63 @@ from pokerlab.mtt.postflop_store import (
     save_postflop_strategy, load_postflop_strategy,
 )
 from pokerlab.mtt.postflop_tree import (
-    PostflopTreeConfig, Street, build_postflop_tree, count_nodes,
+    PostflopTreeConfig, Street,
 )
 
 
-# Согласованные борды для sweep.
-# Каждый — репрезентант своего класса (dry/monotone/paired/broadway).
+# 15 репрезентативных бордов
 BOARDS = {
-    # Dry
-    "K72r":    (["Kd", "7c", "2h"], "flop"),
-    "A83r":    (["Ad", "8c", "3h"], "flop"),
-    # Monotone
-    "AsKsQs":  (["As", "Ks", "Qs"], "flop"),
-    "8h7h6h":  (["8h", "7h", "6h"], "flop"),
-    # Paired
-    "KK2r":    (["Kd", "Kc", "2h"], "flop"),
-    "TT4r":    (["Td", "Tc", "4h"], "flop"),
-    # Broadway
-    "QJT":     (["Qh", "Jd", "Tc"], "flop"),
-    "AJTss":   (["Ah", "Jh", "Th"], "flop"),
-    # Low
-    "654r":    (["6d", "5c", "4h"], "flop"),
-    "422r":    (["4d", "2c", "2h"], "flop"),
+    "A72r":   ["Ad", "7c", "2h"],
+    "A83r":   ["Ad", "8c", "3h"],
+    "AK4r":   ["Ad", "Kc", "4h"],
+    "A95ss":  ["Ah", "9h", "5c"],
+    "K72r":   ["Kd", "7c", "2h"],
+    "KQ4r":   ["Kd", "Qc", "4h"],
+    "K95ss":  ["Kh", "9h", "5c"],
+    "Q72r":   ["Qd", "7c", "2h"],
+    "QJ4r":   ["Qd", "Jc", "4h"],
+    "JT9r":   ["Jd", "Tc", "9h"],
+    "T98r":   ["Td", "9c", "8h"],
+    "987r":   ["9d", "8c", "7h"],
+    "AsKsQs": ["As", "Ks", "Qs"],  # monotone
+    "8h7h6h": ["8h", "7h", "6h"],  # monotone low
+    "KK2r":   ["Kd", "Kc", "2h"],  # paired
 }
 
+# Configs: (pot, stack, name)
+# Configs: (pot, stack, name)
+CONFIGS = [
+    # SRP
+    (4.5, 18.0, "srp_20bb"),
+    (4.5, 28.0, "srp_30bb"),
+    (4.5, 48.0, "srp_50bb"),
+    (4.5, 68.0, "srp_75bb"),
+    (4.5, 93.0, "srp_100bb"),
+    # 3BP
+    (13.0, 24.0, "bp3_30bb"),
+    (13.0, 47.0, "bp3_50bb"),
+    (13.0, 62.0, "bp3_75bb"),
+    (13.0, 87.0, "bp3_100bb"),
+]
 
 def run_one(job: dict) -> dict:
-    board = job["board"]
-    street = Street(job["street"])
     cfg = PostflopTreeConfig(
-        start_pot_bb=job["pot_bb"],
-        start_stack_bb=job["stack_bb"],
-        start_board=board,
-        start_street=street,
+        start_pot_bb=job["pot"],
+        start_stack_bb=job["stack"],
+        start_board=job["board"],
+        start_street=Street.FLOP,
         start_actor="OOP",
     )
-    key = f"{job['label']}_{job['stack_bb']:.0f}bb"
+    key = f"{job['label']}_{job['config_name']}"
 
     t0 = time.time()
     try:
         if job.get("skip_existing", True):
-            existing = load_postflop_strategy(cfg)
-            if (existing is not None
-                    and existing.iterations >= job["iterations"]):
+            ex = load_postflop_strategy(cfg)
+            if ex is not None and ex.u_root is not None and \
+                    ex.iterations >= job["iterations"]:
                 return {"ok": True, "skipped": True, "key": key,
                         "elapsed": 0.0}
-
         solver = PostflopSolverVector(cfg)
         res = solver.solve(iterations=job["iterations"], log_every=0)
         save_postflop_strategy(res)
@@ -82,74 +95,56 @@ def run_one(job: dict) -> dict:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--boards", type=str, nargs="+",
-                   default=None,
-                   help=f"Ключи из {list(BOARDS.keys())}")
-    p.add_argument("--stacks", type=float, nargs="+",
-                   default=[25.0])
-    p.add_argument("--pots", type=float, nargs="+",
-                   default=[6.0],
-                   help="Размер пота на флопе (для SRP ~6)")
-    p.add_argument("--iterations", type=int, default=2000)
-    p.add_argument("--quick", action="store_true",
-                   help="2 борда, 1 стек, 500 итераций")
-    p.add_argument("--workers", type=int, default=0)
+    p.add_argument("--iterations", type=int, default=5000)
+    p.add_argument("--quick", action="store_true")
+    p.add_argument("--workers", type=int, default=3)
     p.add_argument("--no-skip", action="store_true")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.WARNING)
 
+    boards = BOARDS
+    configs = CONFIGS
+    iterations = args.iterations
     if args.quick:
-        args.boards = ["AsKsQs", "K72r"]
-        args.stacks = [25.0]
-        args.iterations = 500
-
-    board_keys = args.boards or list(BOARDS.keys())
+        boards = {"AsKsQs": ["As", "Ks", "Qs"]}
+        configs = [(4.5, 18.0, "srp_20bb")]
+        iterations = 300
 
     jobs = []
-    for label in board_keys:
-        if label not in BOARDS:
-            print(f"Неизвестный борд: {label}")
-            continue
-        board, street = BOARDS[label]
-        for stack in args.stacks:
-            for pot in args.pots:
-                jobs.append({
-                    "label": label,
-                    "board": board,
-                    "street": street,
-                    "pot_bb": pot,
-                    "stack_bb": stack,
-                    "iterations": args.iterations,
-                    "skip_existing": not args.no_skip,
-                })
+    for label, board in boards.items():
+        for pot, stack, cname in configs:
+            jobs.append({
+                "label": label, "board": board,
+                "pot": pot, "stack": stack,
+                "config_name": cname,
+                "iterations": iterations,
+                "skip_existing": not args.no_skip,
+            })
 
-    n_workers = args.workers or max(1, (os.cpu_count() or 1) - 1)
     print(f"Всего задач: {len(jobs)}")
-    print(f"Ядер: {os.cpu_count()}, воркеров: {n_workers}")
-    print(f"Итераций: {args.iterations}")
+    print(f"Бордов: {len(boards)}, конфигов: {len(configs)}")
+    print(f"Итераций: {iterations}")
+    print(f"Воркеров: {args.workers}")
     print()
 
     t0 = time.time()
-    with mp.Pool(processes=n_workers) as pool:
-        for i, result in enumerate(pool.imap_unordered(run_one, jobs), 1):
-            elapsed_total = time.time() - t0
-            status = "OK " if result["ok"] else "ERR"
-            skip = " [skip]" if result.get("skipped") else ""
-            if result["ok"]:
-                print(f"[{i:>3}/{len(jobs)}] {status} "
-                      f"{result['key']:<20} "
-                      f"({result['elapsed']:7.1f}s){skip} "
-                      f"| total {elapsed_total:6.0f}s")
+    with mp.Pool(processes=args.workers) as pool:
+        for i, r in enumerate(pool.imap_unordered(run_one, jobs), 1):
+            et = time.time() - t0
+            st = "OK " if r["ok"] else "ERR"
+            sk = " [skip]" if r.get("skipped") else ""
+            if r["ok"]:
+                print(f"[{i:>3}/{len(jobs)}] {st} {r['key']:<20} "
+                      f"({r['elapsed']:7.1f}s){sk} | total {et:6.0f}s",
+                      flush=True)
             else:
-                print(f"[{i:>3}/{len(jobs)}] {status} "
-                      f"{result['key']:<20} "
-                      f"({result['elapsed']:7.1f}s) "
-                      f"| ERROR: {result['error']}")
+                print(f"[{i:>3}/{len(jobs)}] {st} {r['key']:<20} "
+                      f"({r['elapsed']:7.1f}s) ERR: {r['error']}",
+                      flush=True)
 
-    total = time.time() - t0
     print()
-    print(f"ГОТОВО за {total:.0f}s ({total/60:.1f} мин)")
+    print(f"ГОТОВО за {(time.time()-t0)/60:.1f} мин")
 
 
 if __name__ == "__main__":

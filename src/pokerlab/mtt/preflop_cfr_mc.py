@@ -1,24 +1,12 @@
 """
 Monte-Carlo DCFR для N-player префлоп-солвера (chipEV).
 
-v5.1 (текущая):
-    * `validate_2max` переписан: теперь тестирует ОБЕ модели на ПОЛНОМ
-      дереве (с open/3bet/4bet), где реально существуют постфлоп-узлы.
-    * Добавлен `compare_models`: один стек, два прогона, разные модели,
-      полное дерево. Печатает сравнение диапазонов.
-    * `validate_2max` (push/fold) вынесен в `validate_pushfold_2max`.
-
-v5: параметр postflop_model ("allin_equivalent" | "equity_only").
-v4: DCFR + explicit averaging.
-v3: DCFR, strat_sum только для семплированной руки.
-v2: strat_sum только для семплированной руки.
-v1: strat_sum для всех рук (баг сходимости).
-
-Reference:
-    Brown & Sandholm (2019). Solving Imperfect-Information Games
-    via Discounted Regret Minimization.
-    Lanctot et al. (2009). Monte Carlo Sampling for Regret
-    Minimization in Extensive Games.
+v6.3:
+    * U_avg используется ТОЛЬКО при точном совпадении (pot, stack)
+      с референсными (ref_pot, ref_stack). Иначе fallback на
+      allin_equivalent.
+    * Линейное масштабирование U_avg убрано — оно даёт инверсию
+      (AA пушит вместо open).
 """
 
 from __future__ import annotations
@@ -27,7 +15,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Callable
 
 import numpy as np
 
@@ -39,22 +27,13 @@ from pokerlab.mtt.preflop_tree import (
 
 log = logging.getLogger(__name__)
 
-
-# ============================================================
-# DCFR параметры
-# ============================================================
-
 DCFR_ALPHA = 1.5
 DCFR_BETA = 0.0
 DCFR_GAMMA = 2.0
 
-
-PostflopModel = Literal["allin_equivalent", "equity_only"]
-
-
-# ============================================================
-# Колода
-# ============================================================
+# Параметры, при которых посчитан srp_25bb_pot6_test
+U_AVG_REF_POT = 6.0
+U_AVG_REF_STACK = 25.0
 
 _RANKS = "AKQJT98765432"
 _SUITS = "shdc"
@@ -79,9 +58,22 @@ def _default_evaluator(cards: list[str]) -> int:
     return evaluate_cards(*cards)
 
 
-# ============================================================
-# Результат
-# ============================================================
+def _ip_oop_from_hu(live, n_players):
+    """Возвращает (ip_pos, oop_pos) для HU-пары или None."""
+    if len(live) != 2:
+        return None
+    if n_players == 2:
+        if set(live) == {"SB", "BB"}:
+            return "BB", "SB"
+    elif n_players == 3:
+        if "BTN" in live:
+            ip = "BTN"
+            oop = next(p for p in live if p != "BTN")
+            return ip, oop
+        if set(live) == {"SB", "BB"}:
+            return "BB", "SB"
+    return None
+
 
 @dataclass
 class PreflopStrategyMC:
@@ -94,10 +86,6 @@ class PreflopStrategyMC:
     postflop_model: str = "allin_equivalent"
 
 
-# ============================================================
-# Solver
-# ============================================================
-
 class PreflopSolverMC:
 
     def __init__(
@@ -105,7 +93,10 @@ class PreflopSolverMC:
         cfg: TreeConfig,
         evaluator: Callable[[list[str]], int] | None = None,
         seed: int = 42,
-        postflop_model: PostflopModel = "allin_equivalent",
+        postflop_model: str = "allin_equivalent",
+        postflop_u_avg: np.ndarray | None = None,
+        u_avg_ref_pot: float = U_AVG_REF_POT,
+        u_avg_ref_stack: float = U_AVG_REF_STACK,
     ):
         self.cfg = cfg
         self.positions = list(cfg.positions())
@@ -113,6 +104,9 @@ class PreflopSolverMC:
         self.evaluate = evaluator or _default_evaluator
         self.rng = random.Random(seed)
         self.postflop_model = postflop_model
+        self.postflop_u_avg = postflop_u_avg
+        self.u_avg_ref_pot = u_avg_ref_pot
+        self.u_avg_ref_stack = u_avg_ref_stack
 
         self.hand_to_idx = {h: i for i, h in enumerate(ALL_HANDS)}
 
@@ -153,12 +147,7 @@ class PreflopSolverMC:
         return [p for p, inv in node.invested.items()
                 if inv >= max_inv - 1e-6]
 
-    def _terminal_utils(
-        self,
-        node: PreflopNode,
-        hands: dict[str, list[str]],
-        board: list[str],
-    ) -> dict[str, float]:
+    def _terminal_utils(self, node, hands, board):
         u = {p: 0.0 for p in self.positions}
         pot = float(node.pot_bb)
         inv = dict(node.invested)
@@ -169,47 +158,108 @@ class PreflopSolverMC:
                 u[p] = (pot - inv[p]) if p == winner else -inv[p]
             return u
 
-        if node.allin_showdown or node.goes_to_postflop:
+        if node.allin_showdown:
             live = self._live_players(node)
             if not live:
                 return u
-
-            if node.goes_to_postflop:
-                if self.postflop_model == "allin_equivalent":
-                    S = self.cfg.stack_bb
-                    final_pot = pot
-                    final_inv = dict(inv)
-                    for p in live:
-                        extra = max(0.0, S - inv[p])
-                        final_pot += extra
-                        final_inv[p] = S
-                else:
-                    final_pot = pot
-                    final_inv = dict(inv)
-            else:
-                final_pot = pot
-                final_inv = dict(inv)
-
+            final_pot = pot
+            final_inv = dict(inv)
             ranks = {p: self.evaluate(hands[p] + board) for p in live}
             best = min(ranks.values())
             winners = [p for p, r in ranks.items() if r == best]
             share = final_pot / len(winners)
+            for p in self.positions:
+                u[p] = share - final_inv[p] if p in winners else -final_inv[p]
+            return u
 
+        if node.goes_to_postflop:
+            if self.postflop_u_avg is not None:
+                return self._postflop_value_avg(node, hands, board)
+            # Без U_avg
+            if self.postflop_model == "allin_equivalent":
+                return self._postflop_allin_equivalent(node, hands, board)
+            # equity_only
+            u = {p: 0.0 for p in self.positions}
+            live = self._live_players(node)
+            if not live:
+                return u
+            final_pot = pot
+            final_inv = dict(inv)
+            ranks = {p: self.evaluate(hands[p] + board) for p in live}
+            best = min(ranks.values())
+            winners = [p for p, r in ranks.items() if r == best]
+            share = final_pot / len(winners)
             for p in self.positions:
                 u[p] = share - final_inv[p] if p in winners else -final_inv[p]
             return u
 
         raise ValueError(f"Неизвестный терминал: {node.key()}")
 
-    def _traverse(
-        self,
-        node: PreflopNode,
-        hands: dict[str, list[str]],
-        board: list[str],
-        t: int,
-        alpha_discount: float,
-        beta_discount: float,
-    ) -> dict[str, float]:
+    def _postflop_allin_equivalent(self, node, hands, board):
+        """Allin-equivalent: после колла все идут allin."""
+        u = {p: 0.0 for p in self.positions}
+        live = self._live_players(node)
+        if not live:
+            return u
+        S = self.cfg.stack_bb
+        final_pot = float(node.pot_bb)
+        final_inv = dict(node.invested)
+        for p in live:
+            extra = max(0.0, S - final_inv[p])
+            final_pot += extra
+            final_inv[p] = S
+        ranks = {p: self.evaluate(hands[p] + board) for p in live}
+        best = min(ranks.values())
+        winners = [p for p, r in ranks.items() if r == best]
+        share = final_pot / len(winners)
+        for p in self.positions:
+            u[p] = share - final_inv[p] if p in winners else -final_inv[p]
+        return u
+
+    def _postflop_value_avg(self, node, hands, board):
+        """
+        Использует U_avg ТОЛЬКО если (pot, stack) на терминале
+        совпадают с референсными (ref_pot, ref_stack). Иначе —
+        fallback на allin_equivalent.
+
+        Линейное масштабирование убрано: оно давало инверсию
+        (AA пушит вместо open).
+        """
+        u = {p: 0.0 for p in self.positions}
+        live = self._live_players(node)
+        if not live:
+            return u
+
+        ip_oop = _ip_oop_from_hu(live, self.cfg.n_players)
+        if ip_oop is None:
+            return self._postflop_allin_equivalent(node, hands, board)
+
+        ip_pos, oop_pos = ip_oop
+        pot_at_terminal = float(node.pot_bb)
+        eff_stack_at_terminal = float(self.cfg.stack_bb) - max(
+            float(node.invested.get(ip_pos, 0.0)),
+            float(node.invested.get(oop_pos, 0.0)),
+        )
+
+        pot_match = abs(pot_at_terminal - self.u_avg_ref_pot) < 1.0
+        stack_match = abs(eff_stack_at_terminal - self.u_avg_ref_stack) < 3.0
+
+        if pot_match and stack_match:
+            ip_hand = _canonical_hand(*hands[ip_pos])
+            oop_hand = _canonical_hand(*hands[oop_pos])
+            i_ip = self.hand_to_idx[ip_hand]
+            i_oop = self.hand_to_idx[oop_hand]
+            u_ip = float(self.postflop_u_avg[i_ip, i_oop])
+            u[ip_pos] = u_ip
+            u[oop_pos] = -u_ip
+            for p in self.positions:
+                if p not in live:
+                    u[p] = -float(node.invested.get(p, 0.0))
+            return u
+
+        return self._postflop_allin_equivalent(node, hands, board)
+
+    def _traverse(self, node, hands, board, t, alpha_d, beta_d):
         if node.is_terminal:
             return self._terminal_utils(node, hands, board)
 
@@ -220,62 +270,52 @@ class PreflopSolverMC:
 
         code = _canonical_hand(*hands[actor])
         i_p = self.hand_to_idx[code]
-
         sigma = self._current_strategy(key)[i_p]
 
-        u_actions: list[dict[str, float]] = []
+        u_actions = []
         for action in actions:
             child = node.children[action.short()]
             u_actions.append(self._traverse(
-                child, hands, board, t, alpha_discount, beta_discount,
+                child, hands, board, t, alpha_d, beta_d,
             ))
 
-        u_node: dict[str, float] = {}
-        for p in self.positions:
-            u_node[p] = sum(sigma[a] * u_actions[a][p]
-                            for a in range(n_act))
+        u_node = {p: sum(sigma[a] * u_actions[a][p]
+                         for a in range(n_act))
+                  for p in self.positions}
 
         for a in range(n_act):
             delta = u_actions[a][actor] - u_node[actor]
             old = self.regret[key][i_p, a]
             new_undisc = old + delta
             if new_undisc > 0:
-                self.regret[key][i_p, a] = old * alpha_discount + delta
+                self.regret[key][i_p, a] = old * alpha_d + delta
             else:
-                self.regret[key][i_p, a] = old * beta_discount + delta
+                self.regret[key][i_p, a] = old * beta_d + delta
 
         return u_node
 
     def solve(self, iterations: int = 100_000,
               log_every: int = 10_000) -> PreflopStrategyMC:
-        log.info(
-            "MC-DCFR (%s): %d итераций (%d-max, α=%.1f β=%.1f γ=%.1f)",
-            self.postflop_model, iterations, self.cfg.n_players,
-            DCFR_ALPHA, DCFR_BETA, DCFR_GAMMA,
-        )
+        used_model = ("u_avg" if self.postflop_u_avg is not None
+                      else self.postflop_model)
+        log.info("MC-DCFR (%s): %d итераций (%d-max)",
+                 used_model, iterations, self.cfg.n_players)
         t0 = time.time()
 
         for t in range(1, iterations + 1):
             hands, board = self._sample_deal()
-
-            alpha_discount = (t ** DCFR_ALPHA) / (t ** DCFR_ALPHA + 1.0)
-            beta_discount = (t ** DCFR_BETA) / (t ** DCFR_BETA + 1.0)
-
-            self._traverse(
-                self.root, hands, board, t,
-                alpha_discount, beta_discount,
-            )
-
-            gamma_weight = ((t - 1.0) / t) ** DCFR_GAMMA if t > 1 else 0.0
+            alpha_d = (t ** DCFR_ALPHA) / (t ** DCFR_ALPHA + 1.0)
+            beta_d = (t ** DCFR_BETA) / (t ** DCFR_BETA + 1.0)
+            self._traverse(self.root, hands, board, t, alpha_d, beta_d)
+            gamma_w = ((t - 1.0) / t) ** DCFR_GAMMA if t > 1 else 0.0
             for key in self.regret:
                 sigma_all = self._current_strategy(key)
                 self.strat_sum[key] = (
-                    self.strat_sum[key] * gamma_weight + sigma_all
+                    self.strat_sum[key] * gamma_w + sigma_all
                 )
-
             if log_every and t % log_every == 0:
                 elapsed = time.time() - t0
-                rate = t / elapsed
+                rate = t / elapsed if elapsed > 0 else 0
                 eta = (iterations - t) / rate if rate > 0 else 0
                 log.info("  iter %d/%d | %.0f iter/s | ETA %.0f сек",
                          t, iterations, rate, eta)
@@ -291,8 +331,7 @@ class PreflopSolverMC:
         node_meta = {}
         for node in iter_nodes(self.root):
             node_meta[node.key()] = {
-                "actor": node.actor,
-                "pot_bb": node.pot_bb,
+                "actor": node.actor, "pot_bb": node.pot_bb,
                 "invested": dict(node.invested),
                 "is_terminal": node.is_terminal,
                 "fold_to_win": node.fold_to_win,
@@ -312,165 +351,61 @@ class PreflopSolverMC:
             cfg=self.cfg,
             iterations=iterations,
             elapsed_sec=elapsed,
-            postflop_model=self.postflop_model,
+            postflop_model=used_model,
         )
 
 
-# ============================================================
-# Утилиты
-# ============================================================
-
-def print_root_summary(res: PreflopStrategyMC, top_n: int = 15) -> None:
-    key = "ROOT"
-    if key not in res.strategies:
-        print("Нет ROOT")
-        return
-    sigma = res.strategies[key]
-    actions = res.actions_of[key]
-    actor = res.node_meta[key]["actor"]
-    print(f"--- ROOT (actor={actor}, "
-          f"actions={[a.short() for a in actions]}) ---")
-    print(f"{'Hand':>6} | " + " ".join(f"{a.short():>8}" for a in actions))
-    for i in range(min(top_n, N_HANDS)):
-        row = " ".join(f"{sigma[i, a]:8.3f}" for a in range(len(actions)))
-        print(f"{ALL_HANDS[i]:>6} | {row}")
-
-
-def range_pct(hands: list[str]) -> float:
-    from pokerlab.mtt.cfr_pushfold import COMBOS
-    total = sum(COMBOS[ALL_HANDS.index(h)] for h in hands)
-    return total / 1326.0 * 100
-
-
-def _dom_action(sigma_row: np.ndarray) -> int:
-    """Индекс доминирующего действия."""
-    return int(np.argmax(sigma_row))
-
-
-def _action_summary(res: PreflopStrategyMC, key: str) -> dict:
-    """Сколько рук доминирует в каждом действии узла."""
-    if key not in res.strategies:
-        return {}
-    sigma = res.strategies[key]
-    actions = res.actions_of[key]
-    n_act = len(actions)
-    counts = {a.short(): 0 for a in actions}
-    for i in range(N_HANDS):
-        dom = _dom_action(sigma[i])
-        counts[actions[dom].short()] += 1
-    return counts
-
-
-# ============================================================
-# Тесты
-# ============================================================
-
-def validate_pushfold_2max(stack: float = 10.0,
-                           iterations: int = 50_000) -> None:
-    """
-    Чистый push/fold (открытия отключены). Валидирует ядро CFR.
-    Для сравнения моделей — НЕ использовать (нет постфлоп-узлов).
-    """
+def validate_2max(stack: float = 10.0, iterations: int = 50_000):
     cfg = TreeConfig(
         n_players=2, stack_bb=stack, ante_bb=0.0,
-        open_size=stack + 100,
-        three_bet_size=stack + 100,
+        open_size=stack + 100, three_bet_size=stack + 100,
         four_bet_size=stack + 100,
     )
     solver = PreflopSolverMC(cfg, seed=42)
     res = solver.solve(iterations=iterations, log_every=0)
-
     sigma = res.strategies["ROOT"]
     actions = res.actions_of["ROOT"]
     idx_push = next(i for i, a in enumerate(actions)
                     if a.type == ActionType.ALLIN)
-
-    push_hands = [ALL_HANDS[i] for i in range(N_HANDS)
-                  if sigma[i, idx_push] > 0.5]
-    print(f"[push/fold validate, {stack} BB] "
-          f"push {len(push_hands)} рук ({range_pct(push_hands):.1f}%)")
-    for h in ("AA", "KK", "QQ", "AKs", "AKo", "72o"):
+    push = [ALL_HANDS[i] for i in range(N_HANDS)
+            if sigma[i, idx_push] > 0.5]
+    from pokerlab.mtt.cfr_pushfold import COMBOS
+    pct = sum(COMBOS[ALL_HANDS.index(h)] for h in push) / 1326.0 * 100
+    print(f"[push/fold {stack} BB] push {len(push)} ({pct:.1f}%)")
+    for h in ("AA", "KK", "QQ", "AKs", "72o"):
         i = ALL_HANDS.index(h)
         print(f"  {h}: push={sigma[i, idx_push]:.3f}")
 
 
-def compare_models(stack: float = 30.0,
-                   iterations: int = 100_000,
-                   n_players: int = 2) -> None:
-    """
-    Сравнение моделей на ПОЛНОМ дереве (с open/3bet/4bet).
+def demo_3max_with_u_avg(stack: float = 20.0,
+                          iterations: int = 30_000):
+    from pokerlab.mtt.postflop_value import load_average_u
+    u_avg = load_average_u("srp_25bb_pot6_test")
+    if u_avg is None:
+        print("U_avg не найден.")
+        return
+    print(f"Загружен U_avg shape={u_avg.shape}")
 
-    Это правильный тест: узлы `goes_to_postflop` существуют,
-    и postflop_model реально влияет на результат.
-    """
-    print(f"=== Сравнение моделей на {stack} BB ({n_players}-max) ===")
-    print(f"    iterations = {iterations}")
-    print()
-
-    results: dict[str, PreflopStrategyMC] = {}
-
-    for model in ("allin_equivalent", "equity_only"):
-        cfg = TreeConfig(n_players=n_players, stack_bb=stack, ante_bb=0.0)
-        solver = PreflopSolverMC(cfg, seed=42, postflop_model=model)
-        n_nodes = node_count(solver.root)
-        n_postflop = sum(1 for nd in iter_nodes(solver.root)
-                         if nd.goes_to_postflop)
-        print(f"--- {model} | дерево: {n_nodes} узлов, "
-              f"postflop-терминалов: {n_postflop} ---")
-        res = solver.solve(iterations=iterations, log_every=0)
-        results[model] = res
-        print()
-
-    # --- Сравнение ROOT ---
-    print("=== ROOT сравнение ===")
-    r_a = results["allin_equivalent"]
-    r_b = results["equity_only"]
-    actions = r_a.actions_of["ROOT"]
-
-    print(f"Действия ROOT: {[a.short() for a in actions]}")
-    print()
-
-    counts_a = _action_summary(r_a, "ROOT")
-    counts_b = _action_summary(r_b, "ROOT")
-    print(f"{'Action':>10} | {'allin_equiv':>12} | {'equity_only':>12} | delta")
-    for a in actions:
-        s = a.short()
-        print(f"{s:>10} | {counts_a.get(s, 0):>12} | "
-              f"{counts_b.get(s, 0):>12} | "
-              f"{counts_b.get(s, 0) - counts_a.get(s, 0):+d}")
-
-    # Ключевые руки
-    print()
-    print("=== Ключевые руки на ROOT ===")
-    sigma_a = r_a.strategies["ROOT"]
-    sigma_b = r_b.strategies["ROOT"]
-    header = " ".join(f"{a.short():>14}" for a in actions)
-    print(f"{'Hand':>6} | {header}")
-    for h in ("AA", "KK", "QQ", "AKs", "AKo", "AQs", "T9s", "72o"):
-        i = ALL_HANDS.index(h)
-        row_a = " ".join(f"{sigma_a[i, x]:.3f}/{sigma_b[i, x]:.3f}".rjust(14)
-                         for x in range(len(actions)))
-        print(f"{h:>6} | {row_a}")
-
-    # Также — стандартный summary
-    print()
-    print("--- allin_equivalent ---")
-    print_root_summary(r_a, top_n=10)
-    print()
-    print("--- equity_only ---")
-    print_root_summary(r_b, top_n=10)
-
-
-def demo_3max(stack: float = 20.0,
-              iterations: int = 30_000,
-              postflop_model: PostflopModel = "allin_equivalent") -> None:
     cfg = TreeConfig(n_players=3, stack_bb=stack, ante_bb=0.0)
-    solver = PreflopSolverMC(cfg, seed=42, postflop_model=postflop_model)
-    print(f"3-max дерево: {node_count(solver.root)} узлов, "
-          f"модель: {postflop_model}")
-    res = solver.solve(iterations=iterations, log_every=5_000)
-    print()
-    print_root_summary(res, top_n=10)
+    solver = PreflopSolverMC(cfg, seed=42, postflop_u_avg=u_avg)
+    res = solver.solve(iterations=iterations, log_every=10000)
+
+    for key in ("ROOT", "ROOT/BTN:r2.00/BB:c",
+                "ROOT/BTN:r2.00/SB:c/BB:c"):
+        if key not in res.strategies:
+            continue
+        σ = res.strategies[key]
+        actions = res.actions_of[key]
+        actor = res.node_meta[key]["actor"]
+        print(f"\n--- {key} (actor={actor}) ---")
+        print(f"{'Hand':>6} | " + " ".join(f"{a.short():>8}"
+                                            for a in actions))
+        for h in ("AA", "KK", "QQ", "AKs", "AKo", "AQs",
+                  "AJs", "KQo", "T9s", "72o", "32o"):
+            i = ALL_HANDS.index(h)
+            row = " ".join(f"{σ[i, a]:8.3f}"
+                           for a in range(len(actions)))
+            print(f"{h:>6} | {row}")
 
 
 if __name__ == "__main__":
@@ -480,13 +415,8 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
-
     if len(sys.argv) > 1 and sys.argv[1] == "validate":
-        validate_pushfold_2max(stack=10.0, iterations=50_000)
-        validate_pushfold_2max(stack=20.0, iterations=50_000)
-    elif len(sys.argv) > 2 and sys.argv[1] == "compare":
-        stack = float(sys.argv[2])
-        n = int(sys.argv[3]) if len(sys.argv) > 3 else 2
-        compare_models(stack=stack, iterations=100_000, n_players=n)
+        validate_2max(stack=10.0, iterations=50_000)
+        validate_2max(stack=20.0, iterations=50_000)
     else:
-        demo_3max(stack=20.0, iterations=30_000)
+        demo_3max_with_u_avg(stack=20.0, iterations=100_000)
