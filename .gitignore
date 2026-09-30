@@ -37,3 +37,8 @@ overnight_*.log
 /dump_hand.py
 /check_hu_results.py
 /clear_hu.py
+# Backups of preflop_equity
+data/preflop_equity.json.*
+data/*.bak
+data/*.bak2
+data/*.old
