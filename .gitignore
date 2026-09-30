@@ -8,27 +8,32 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
-# Данные (не коммитим)
-data/*.db
-data/*.db-wal
-data/*.db-shm
-data/sample_hh/*
-!data/sample_hh/.gitkeep
-data/preflop_equity.json.old
-data/preflop_equity.json.bak
-data/preflop_equity.json.bak2
-
-# Окружение
+# Env
 .env
+.env.local
 
 # IDE
 .vscode/
 .idea/
-*.swp
 
 # OS
 .DS_Store
 Thumbs.db
 
+# PokerLab artifacts (НЕ коммитить — генерируется скриптами)
+data/preflop_strategies/
+data/postflop_strategies/
+data/preflop_equity.json
+data/pokerlab.db
+data/sample_hh/*.txt
+
 # Логи
 *.log
+overnight_*.log
+
+# Временные debug-скрипты в корне
+/tmp_dump.py
+/debug_*.py
+/dump_hand.py
+/check_hu_results.py
+/clear_hu.py

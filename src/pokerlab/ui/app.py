@@ -95,6 +95,7 @@ tab_labels = [
     "Раздачи",
     "Расписание",
     "Расчёты",
+    "HU Review",
     "Результаты",
 ]
 (
@@ -102,6 +103,7 @@ tab_labels = [
     tab_hands,
     tab_schedule,
     tab_analysis,
+    tab_hu,
     tab_results,
 ) = st.tabs(tab_labels)
 
@@ -115,6 +117,7 @@ from pokerlab.ui.tabs import (  # noqa: E402
     hands as tab_hands_mod,
     schedule as tab_schedule_mod,
     analysis as tab_analysis_mod,
+    hu_review as tab_hu_mod,
     results as tab_results_mod,
 )
 
@@ -131,6 +134,7 @@ with tab_schedule:
 
 with tab_analysis:
     tab_analysis_mod.render(results)
-
+with tab_hu:
+    tab_hu_mod.render()
 with tab_results:
     tab_results_mod.render(results)

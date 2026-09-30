@@ -55,12 +55,12 @@ h3 {
 }
 
 /* ============================================================
-   ВЕРХНИЕ ВКЛАДКИ — 5 прямоугольников 2:1, тёмно-серые
+   ВЕРХНИЕ ВКЛАДКИ — 6 прямоугольников 2:1, тёмно-серые
    ============================================================ */
 div[role="tablist"],
 [data-baseweb="tab-list"] {
     display: grid !important;
-    grid-template-columns: repeat(5, minmax(0, 1fr)) !important;
+    grid-template-columns: repeat(6, minmax(0, 1fr)) !important;
     gap: 12px !important;
     width: 100% !important;
     max-width: 100% !important;
